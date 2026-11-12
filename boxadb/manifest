@@ -1,9 +1,9 @@
 appname=boxadb
-version=0.1.0
+version=0.1.8
 display_name=盒子助手
 desc=网页版 ADB 助手（盒子/电视专用）：安装 APK/XAPK/APKM、ADB 终端、遥控器、截图、重启。经飞牛统一网关访问，与 NAS 同源。
-maintainer=悟空的日常
-maintainer_url=https://space.bilibili.com/250915741
+maintainer=wukongdaily
+maintainer_url=https://github.com/wukongdaily/boxadb-fnos
 source=thirdparty
 platform=all
 desktop_uidir=ui
