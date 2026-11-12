@@ -22,3 +22,15 @@ appcenter-cli install-fpk boxadb.fpk   # 或应用中心 → 手动安装
 - 桥目标限「私网 IPv4 + 端口 5555」且仅管理员可用（网关 `X-Trim-Isadmin`）。
 - 桥随网页会话存在：页面全关 → 到盒子的 TCP 立即断；`ctl_stop=true` 可在应用中心停止整个应用。
 - 前端改动后：在桌面版 boxadb 改 → 跑 `scripts/sync-ui.sh` → NAS 上重新 `fnpack build`。
+
+## 第三方组件致谢（均为 MIT）
+
+- **[@yume-chan/ya-webadb (Tango)](https://github.com/yume-chan/ya-webadb)** —— ADB 协议引擎（Simon Chan）
+- **[xterm.js](https://xtermjs.org/)** —— 浏览器终端
+- **[fflate](https://github.com/101arrowz/fflate)** —— APK/XAPK 解包
+
+版权声明与许可全文见 [`boxadb/app/www/js/vendor/THIRD-PARTY-LICENSES.md`](boxadb/app/www/js/vendor/THIRD-PARTY-LICENSES.md)。
+
+## 许可
+
+[MIT](boxadb/LICENSE)
