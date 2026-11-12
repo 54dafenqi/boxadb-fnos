@@ -1,0 +1,9 @@
+# 构建产物
+dist/
+*.fpk
+*.zip
+
+# 系统/编辑器
+.DS_Store
+.vscode/
+.idea/

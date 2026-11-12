@@ -1,0 +1,315 @@
+#!/usr/bin/env node
+'use strict';
+
+// 盒子助手 · 飞牛 fnOS 服务端（MIT）
+// 职责只有两件事：
+//   1) 把盒子助手的网页（app/www）发给浏览器；
+//   2) 在浏览器的 WebSocket 与局域网盒子之间搬运 TCP 字节。
+// 本服务不解析 ADB 协议——ADB 全部由浏览器端的 MIT 引擎处理，
+// 这里只是 WebSocket(RFC 6455, IETF 公开规范) 与 TCP 之间的透明管道。
+//
+// 运行形态：飞牛统一网关把 https://<NAS>/app/boxadb/* 校验登录态后
+// 转发到本服务的 Unix socket；页面与桥同源，因此不存在混合内容问题。
+
+const http = require('node:http');
+const fs = require('node:fs');
+const path = require('node:path');
+const net = require('node:net');
+const crypto = require('node:crypto');
+
+// ── 配置（飞牛生命周期注入；本地开发可省略）──
+const conf = {
+  socketPath: process.env.SOCKET_PATH || '',                       // Unix socket 路径
+  devPort: Number(process.env.PORT || 8765),                       // 无 socket 时的本地调试端口
+  webRoot: process.env.WEB_ROOT || path.join(__dirname, '..', 'www'),
+  prefix: (process.env.GATEWAY_PREFIX || '/app/boxadb').replace(/\/+$/, ''),
+  adminRequired: process.env.BOXADB_REQUIRE_ADMIN === '1',
+  tunnelPort: Number(process.env.BOXADB_ALLOWED_PORT || 5555),     // 唯一放行的目标端口
+  idleExitSec: Number(process.env.BRIDGE_IDLE_SECONDS || 0),       // >0：无会话 N 秒后自退
+};
+
+// ── WebSocket 帧编解码（按 RFC 6455 实现；服务端发出帧不加掩码）──
+const Op = { CONT: 0x0, TEXT: 0x1, BIN: 0x2, CLOSE: 0x8, PING: 0x9, PONG: 0xa };
+
+function encodeFrame(op, body = Buffer.alloc(0)) {
+  const len = body.length;
+  let head;
+  if (len < 126) {
+    head = Buffer.from([0x80 | op, len]);
+  } else if (len <= 0xffff) {
+    head = Buffer.alloc(4);
+    head[0] = 0x80 | op; head[1] = 126;
+    head.writeUInt16BE(len, 2);
+  } else {
+    head = Buffer.alloc(10);
+    head[0] = 0x80 | op; head[1] = 127;
+    head.writeBigUInt64BE(BigInt(len), 2);
+  }
+  return Buffer.concat([head, body]);
+}
+
+function encodeClose(code, text = '') {
+  const reason = Buffer.from(String(text).slice(0, 120));
+  const body = Buffer.alloc(2 + reason.length);
+  body.writeUInt16BE(code, 0);
+  reason.copy(body, 2);
+  return encodeFrame(Op.CLOSE, body);
+}
+
+// 把socket上的字节流拼装成完整消息；控制帧即时回调，数据帧凑齐 FIN 后回调
+class FrameStream {
+  constructor(onData, onControl) {
+    this.onData = onData;
+    this.onControl = onControl;
+    this.buf = Buffer.alloc(0);
+    this.partial = [];
+    this.failed = false;
+  }
+  push(chunk) {
+    if (this.failed) return;
+    this.buf = this.buf.length ? Buffer.concat([this.buf, chunk]) : chunk;
+    try {
+      for (;;) {
+        if (this.buf.length < 2) return;
+        const b0 = this.buf[0], b1 = this.buf[1];
+        const final = (b0 & 0x80) !== 0;
+        const op = b0 & 0x0f;
+        let len = b1 & 0x7f;
+        let head = 2;
+        if (len === 126) {
+          if (this.buf.length < 4) return;
+          len = this.buf.readUInt16BE(2); head = 4;
+        } else if (len === 127) {
+          if (this.buf.length < 10) return;
+          const big = this.buf.readBigUInt64BE(2); head = 10;
+          if (big > 64n * 1024n * 1024n) { this.fail('帧超限'); return; }
+          len = Number(big);
+        }
+        let mask = null;
+        if ((b1 & 0x80) !== 0) {
+          if (this.buf.length < head + 4) return;
+          mask = this.buf.subarray(head, head + 4); head += 4;
+        }
+        if (this.buf.length < head + len) return;
+        const body = Buffer.from(this.buf.subarray(head, head + len));
+        this.buf = this.buf.subarray(head + len);
+        if (mask) for (let i = 0; i < body.length; i++) body[i] ^= mask[i & 3];
+        this.dispatch(op, final, body);
+        if (this.buf.length === 0) return;
+      }
+    } catch (err) { this.fail(err.message || String(err)); }
+  }
+  dispatch(op, final, body) {
+    if (op === Op.CLOSE || op === Op.PING || op === Op.PONG) {
+      this.onControl(op, body);
+      return;
+    }
+    if (op === Op.TEXT || op === Op.BIN) {
+      if (final) { this.partial = []; this.onData(body); }
+      else { this.partial = [body]; }
+      return;
+    }
+    if (op === Op.CONT) {
+      if (!this.partial.length) { this.fail('孤立的 continuation 帧'); return; }
+      this.partial.push(body);
+      if (final) { this.onData(Buffer.concat(this.partial)); this.partial = []; }
+      return;
+    }
+    this.fail(`未知操作码 0x${op.toString(16)}`);
+  }
+  fail(msg) { this.failed = true; this.onControl(Op.CLOSE, Buffer.from(msg.slice(0, 120))); }
+}
+
+// ── 会话计数与空闲自退 ──
+let liveTunnels = 0;
+let idleTimer = null;
+function tunnelOpened() { liveTunnels++; if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; } }
+function tunnelClosed() {
+  liveTunnels = Math.max(0, liveTunnels - 1);
+  if (conf.idleExitSec > 0 && liveTunnels === 0) {
+    idleTimer = setTimeout(() => {
+      if (liveTunnels === 0) process.exit(0);   // 释放一切，可在应用中心再次启动
+    }, conf.idleExitSec * 1000);
+  }
+}
+
+// ── 桥接：WS ↔ TCP ──
+function openTunnel(ws, target) {
+  const upstream = net.connect({ host: target.host, port: target.port });
+  upstream.setNoDelay(true);
+  let upstreamReady = false;
+  const queued = [];
+  let downstreamOpen = true;
+  const finish = (why) => {
+    if (downstreamOpen) {
+      downstreamOpen = false;
+      try { ws.write(encodeClose(1000, why)); } catch {}
+      try { ws.destroy(); } catch {}
+    }
+    upstream.destroy();
+    tunnelClosed();
+    say(`tunnel end [${target.host}:${target.port}] ${why}`);
+  };
+
+  upstream.on('connect', () => {
+    upstreamReady = true;
+    for (const b of queued) upstream.write(b);
+    queued.length = 0;
+  });
+  upstream.on('data', (chunk) => ws.write(encodeFrame(Op.BIN, chunk)));
+  upstream.on('end', () => finish('upstream closed'));
+  upstream.on('error', (e) => finish(`upstream error: ${e.message}`));
+
+  const frames = new FrameStream(
+    (payload) => {
+      if (!downstreamOpen) return;
+      if (upstreamReady) upstream.write(payload);
+      else queued.push(payload);
+    },
+    (op, body) => {
+      if (op === Op.CLOSE) finish('client sent close');
+      else if (op === Op.PING) ws.write(encodeFrame(Op.PONG, body));
+    }
+  );
+  ws.on('data', (c) => frames.push(c));
+  ws.on('close', () => finish('client disconnected'));
+  ws.on('error', () => finish('client socket error'));
+}
+
+// ── WebSocket 升级（RFC 6455 第 4.2 节握手）──
+const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+const acceptValue = (nonce) =>
+  crypto.createHash('sha1').update(nonce + WS_GUID).digest('base64');
+
+function isPrivateIPv4(host) {
+  if (!/^(?:\d{1,3}\.){3}\d{1,3}$/.test(host)) return false;
+  const [a, b] = host.split('.').map(Number);
+  if (a === 10 || a === 127 || (a === 192 && b === 168)) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 169 && b === 254) return true;
+  return false;
+}
+
+function handleUpgrade(req, socket, head) {
+  let url;
+  try { url = new URL(req.url, 'http://localhost'); } catch { socket.destroy(); return; }
+  if (url.pathname !== `${conf.prefix}/adb`) { socket.destroy(); return; }
+
+  const target = { host: url.searchParams.get('host') || '', port: Number(url.searchParams.get('port')) };
+  const reject = (code, msg) => {
+    socket.write(`HTTP/1.1 ${code}\r\nConnection: close\r\nContent-Length: ${Buffer.byteLength(msg)}\r\n\r\n${msg}`);
+    socket.destroy();
+    say(`tunnel rejected: ${msg}`);
+  };
+
+  if (conf.adminRequired && String(req.headers['x-trim-isadmin'] || '').toLowerCase() !== 'true') {
+    return reject(403, 'bridge is restricted to fnOS administrators');
+  }
+  if (!isPrivateIPv4(target.host)) {
+    return reject(403, 'target host must be a private IPv4 address');
+  }
+  if (target.port !== conf.tunnelPort) {
+    return reject(403, `target port must be ${conf.tunnelPort}`);
+  }
+  const nonce = req.headers['sec-websocket-key'];
+  if (!nonce || String(req.headers.upgrade || '').toLowerCase() !== 'websocket') {
+    socket.destroy(); return;
+  }
+
+  socket.write(
+    'HTTP/1.1 101 Switching Protocols\r\n' +
+    'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
+    `Sec-WebSocket-Accept: ${acceptValue(nonce)}\r\n\r\n`
+  );
+  socket.setNoDelay(true);
+  if (head && head.length) socket.emit('data', head);
+  tunnelOpened();
+  say(`tunnel open [${target.host}:${target.port}]`);
+  openTunnel(socket, target);
+}
+
+// ── 静态页 ──
+const MIME = {
+  html: 'text/html; charset=utf-8', htm: 'text/html; charset=utf-8',
+  css: 'text/css; charset=utf-8', js: 'application/javascript; charset=utf-8',
+  mjs: 'application/javascript; charset=utf-8', json: 'application/json; charset=utf-8',
+  png: 'image/png', jpg: 'image/jpeg', svg: 'image/svg+xml', ico: 'image/x-icon',
+  webp: 'image/webp', woff: 'font/woff', woff2: 'font/woff2', txt: 'text/plain; charset=utf-8',
+};
+
+function servePage(req, res, url) {
+  let rel = '/';
+  try { rel = decodeURIComponent(url.pathname.slice(conf.prefix.length)) || '/'; }
+  catch { res.writeHead(400).end('bad request'); return; }
+  if (rel === '/' || rel === '') rel = '/index.html';
+
+  const root = path.resolve(conf.webRoot);
+  const file = path.resolve(root, '.' + path.posix.normalize(rel));
+  if (file !== root && !file.startsWith(root + path.sep)) {
+    res.writeHead(403).end('forbidden');
+    return;
+  }
+  fs.stat(file, (err, st) => {
+    if (err || !st.isFile()) { res.writeHead(404).end('not found'); return; }
+    const ext = file.slice(file.lastIndexOf('.') + 1).toLowerCase();
+    res.writeHead(200, {
+      'Content-Type': MIME[ext] || 'application/octet-stream',
+      'Content-Length': st.size,
+      'Cache-Control': 'no-store',
+    });
+    if (req.method === 'HEAD') { res.end(); return; }
+    fs.createReadStream(file).pipe(res);
+  });
+}
+
+// ── HTTP 服务 ──
+const app = http.createServer((req, res) => {
+  let url;
+  try { url = new URL(req.url, 'http://localhost'); }
+  catch { res.writeHead(400).end('bad request'); return; }
+
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    res.writeHead(405).end('method not allowed');
+    return;
+  }
+  if (url.pathname === `${conf.prefix}/health`) {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' }).end('boxadb fnos ok\n');
+    return;
+  }
+  // 飞牛入口 url=/app/boxadb 不带斜杠：302 到规范地址，
+  // 否则页面里的相对资源（css/js）会解析到 /app/ 下而全部 404。
+  if (url.pathname === conf.prefix) {
+    res.writeHead(302, { Location: `${conf.prefix}/` }).end();
+    return;
+  }
+  if (url.pathname.startsWith(`${conf.prefix}/`)) {
+    servePage(req, res, url);
+    return;
+  }
+  res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }).end(`only ${conf.prefix}/ is served\n`);
+});
+
+app.on('upgrade', handleUpgrade);
+app.on('clientError', (err, socket) => { try { socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); } catch {} });
+
+// ── 启动 ──
+const say = (...a) => console.log(new Date().toISOString(), ...a);
+
+function boot() {
+  if (conf.socketPath) {
+    try { fs.rmSync(conf.socketPath, { force: true }); } catch {}
+    app.listen(conf.socketPath, () => {
+      say(`boxadb-fnos ready  socket=${conf.socketPath}  prefix=${conf.prefix}  admin=${conf.adminRequired}  tunnelPort=${conf.tunnelPort}`);
+    });
+  } else {
+    app.listen(conf.devPort, '127.0.0.1', () => {
+      say(`boxadb-fnos ready (dev) http://127.0.0.1:${conf.devPort}${conf.prefix}/`);
+    });
+  }
+}
+boot();
+
+process.on('SIGTERM', () => { app.close(() => process.exit(0)); if (conf.socketPath) { try { fs.rmSync(conf.socketPath, { force: true }); } catch {} } process.exit(0); });
+process.on('SIGINT', () => { app.close(() => process.exit(0)); if (conf.socketPath) { try { fs.rmSync(conf.socketPath, { force: true }); } catch {} } process.exit(0); });
+process.on('uncaughtException', (e) => console.error(new Date().toISOString(), 'uncaught:', (e && e.stack) || e));
+process.on('unhandledRejection', (r) => console.error(new Date().toISOString(), 'unhandled:', r));

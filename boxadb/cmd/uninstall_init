@@ -1,0 +1,4 @@
+#!/bin/bash
+# 卸载前：清理运行痕迹（pid / socket）
+rm -f "${TRIM_PKGVAR}/app.pid" "${TRIM_APPDEST}/app.sock" 2>/dev/null || true
+exit 0

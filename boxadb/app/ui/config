@@ -1,0 +1,14 @@
+{
+  ".url": {
+    "boxadb.main": {
+      "title": "盒子助手",
+      "icon": "images/icon_{0}.png",
+      "type": "iframe",
+      "protocol": "",
+      "gatewayPrefix": "/app/boxadb",
+      "gatewaySocket": "app.sock",
+      "url": "/app/boxadb",
+      "allUsers": true
+    }
+  }
+}

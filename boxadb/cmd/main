@@ -1,0 +1,80 @@
+#!/bin/bash
+LOG_FILE="${TRIM_PKGVAR}/app.log"
+PID_FILE="${TRIM_PKGVAR}/app.pid"
+GATEWAY_PREFIX="/app/boxadb"
+SOCKET_PATH="${TRIM_APPDEST}/app.sock"
+WEB_ROOT="${TRIM_APPDEST}/www"
+SERVER_JS="${TRIM_APPDEST}/server/server.js"
+
+# Node 运行时：install_dep_apps 声明的运行时包安装在 /var/apps/<id>/target/bin
+for rt in nodejs_v24 nodejs_v22 nodejs; do
+  if [ -d "/var/apps/${rt}/target/bin" ]; then
+    export PATH="/var/apps/${rt}/target/bin:$PATH"
+    break
+  fi
+done
+
+log_msg() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"; }
+check_process() { local pid="$1"; kill -0 "$pid" 2>/dev/null; }
+status_app() {
+  if [ -f "$PID_FILE" ]; then
+    local pid
+    pid="$(head -n 1 "$PID_FILE" | tr -d '[:space:]')"
+    if [ -n "$pid" ] && check_process "$pid"; then return 0; fi
+    rm -f "$PID_FILE"
+  fi
+  return 1
+}
+start_app() {
+  if status_app; then return 0; fi
+  NODE_BIN=""
+  for rt in nodejs_v24 nodejs_v22 nodejs; do
+    if [ -x "/var/apps/${rt}/target/bin/node" ]; then
+      NODE_BIN="/var/apps/${rt}/target/bin/node"
+      break
+    fi
+  done
+  if [ -z "$NODE_BIN" ] && command -v node >/dev/null 2>&1; then
+    NODE_BIN="$(command -v node)"
+  fi
+  if [ -z "$NODE_BIN" ]; then
+    echo "缺少 Node.js 运行时：请先在应用中心安装依赖「Node.js v24」，再启动本应用。" > "$TRIM_TEMP_LOGFILE"
+    exit 1
+  fi
+  log_msg "启动盒子助手（boxadb ${TRIM_APPVER:-?}），node=$NODE_BIN ..."
+  BOXADB_REQUIRE_ADMIN=1 BOXADB_ALLOWED_PORT=5555 \
+    SOCKET_PATH="$SOCKET_PATH" WEB_ROOT="$WEB_ROOT" GATEWAY_PREFIX="$GATEWAY_PREFIX" \
+    "$NODE_BIN" "$SERVER_JS" >> "$LOG_FILE" 2>&1 &
+  echo "$!" > "$PID_FILE"
+  # 等 socket 出现（最多 10 秒）；等不到=启动失败，把日志尾部交给飞牛弹窗展示
+  local n=0
+  while [ ! -S "$SOCKET_PATH" ] && [ "$n" -lt 10 ]; do sleep 1; n=$((n+1)); done
+  if [ ! -S "$SOCKET_PATH" ]; then
+    if check_process "$(cat "$PID_FILE" 2>/dev/null)"; then
+      kill -KILL "$(cat "$PID_FILE")" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE"
+    echo "服务启动失败：未创建网关 socket，最近日志：$(tail -3 "$LOG_FILE" 2>/dev/null | tr '\n' ' | ')" > "$TRIM_TEMP_LOGFILE"
+    exit 1
+  fi
+  log_msg "已启动 pid=$(cat "$PID_FILE") socket=$SOCKET_PATH"
+}
+stop_app() {
+  log_msg "停止盒子助手..."
+  if [ ! -f "$PID_FILE" ]; then return 0; fi
+  local pid
+  pid="$(head -n 1 "$PID_FILE" | tr -d '[:space:]')"
+  if [ -z "$pid" ] || ! check_process "$pid"; then rm -f "$PID_FILE"; return 0; fi
+  kill -TERM "$pid" 2>>"$LOG_FILE" || true
+  local n=0
+  while check_process "$pid" && [ "$n" -lt 10 ]; do sleep 1; n=$((n+1)); done
+  if check_process "$pid"; then kill -KILL "$pid" 2>>"$LOG_FILE" || true; fi
+  rm -f "$PID_FILE" "$SOCKET_PATH"
+  log_msg "已停止，socket 已清理。"
+}
+case "$1" in
+  start)  start_app ;;
+  stop)   stop_app ;;
+  status) if status_app; then exit 0; fi; exit 3 ;;
+  *)      echo "Unknown command: $1" > "$TRIM_TEMP_LOGFILE"; exit 1 ;;
+esac

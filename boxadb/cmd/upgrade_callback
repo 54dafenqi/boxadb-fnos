@@ -1,0 +1,4 @@
+#!/bin/bash
+# 升级后：确保新文件可执行（飞牛会自动重启应用）
+chmod +x "${TRIM_APPDEST}/server/server.js" 2>/dev/null || true
+exit 0

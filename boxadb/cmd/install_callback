@@ -1,0 +1,4 @@
+#!/bin/bash
+# 安装后：确保服务脚本可执行
+chmod +x "${TRIM_APPDEST}/server/server.js" 2>/dev/null || true
+exit 0
