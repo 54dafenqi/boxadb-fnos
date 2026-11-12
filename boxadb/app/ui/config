@@ -1,6 +1,6 @@
 {
   ".url": {
-    "boxadb.main": {
+    "boxadb.Application": {
       "title": "盒子助手",
       "icon": "images/icon_{0}.png",
       "type": "iframe",
