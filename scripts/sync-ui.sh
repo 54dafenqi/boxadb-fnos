@@ -6,10 +6,10 @@ PKG="$ROOT/boxadb"
 DST="$PKG/app/www"
 mkdir -p "$DST"
 
-# 同步前端（rsync --delete：以桌面版为准；剔除 NAS 包不需要的桌面专属文件）
-rsync -a --delete \
+# 同步前端（rsync --delete：以桌面版为准；剔除 NAS 包不需要的桌面专属/开发文件）
+rsync -a --delete --delete-excluded \
   --exclude 'AppIcon.icns' --exclude 'AppIcon.ico' \
-  --exclude 'AppIcon.png'  --exclude 'make_icon.swift' \
+  --exclude 'AppIcon.png'  --exclude '*.swift' \
   "$SRC/index.html" "$SRC/css" "$SRC/js" "$SRC/assets" "$DST/"
 
 # 给 tango.js 打同源补丁（独立 python 脚本：跨行匹配 + 失败即报错）
