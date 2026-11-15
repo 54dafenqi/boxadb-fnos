@@ -262,6 +262,103 @@ function servePage(req, res, url) {
   });
 }
 
+// ── 「从 NAS 选择安装包」：调飞牛开放 API 校验用户 ACL，再读授权文件回流浏览器 ──
+const APP_NAME = 'boxadb';
+const OPENAPI_SOCKET = '/var/run/trim_open_gateway_apiscope.socket';
+const NAS_EXT = new Set(['apk', 'xapk', 'apkm']);
+
+// 通过 Unix Socket 调 fnOS 后端 API（POST /api/v1/trimapp，Bearer TRIM_API_TOKEN）
+function trimCall(reqName, data) {
+  return new Promise((resolve, reject) => {
+    const token = process.env.TRIM_API_TOKEN;
+    if (!token) return reject(new Error('TRIM_API_TOKEN 未注入'));
+    const body = JSON.stringify({ reqId: String(Date.now()), req: reqName, appName: APP_NAME, data });
+    const rq = http.request({
+      socketPath: OPENAPI_SOCKET, path: '/api/v1/trimapp', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token, 'Content-Length': Buffer.byteLength(body) },
+    }, (rs) => {
+      let d = ''; rs.on('data', (c) => { d += c; }); rs.on('end', () => { try { resolve(JSON.parse(d)); } catch (e) { reject(e); } });
+    });
+    rq.on('error', reject);
+    rq.write(body); rq.end();
+  });
+}
+
+function json(res, code, obj) { const s = JSON.stringify(obj); res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }).end(s); }
+
+// 只允许 /vol 卷下、扩展名合规、不含越权的绝对路径
+function nasPathOk(p) {
+  if (typeof p !== 'string' || !p.startsWith('/vol')) return false;
+  if (p.includes('\0') || p.includes('..')) return false;
+  const norm = path.posix.normalize(p);
+  if (norm !== p) return false;
+  const dot = norm.lastIndexOf('.');
+  if (dot < 0 || dot < norm.lastIndexOf('/')) return false;
+  return NAS_EXT.has(norm.slice(dot + 1).toLowerCase());
+}
+
+async function handleNasFile(req, res, url) {
+  const uid = Number(req.headers['x-trim-userid']);
+  if (!Number.isFinite(uid)) return json(res, 403, { error: 'no-user' });
+  const p = url.searchParams.get('path') || '';
+  if (!nasPathOk(p)) return json(res, 400, { error: 'bad-path' });
+  let acl;
+  try { acl = await trimCall('trim.file.checkUserACL', { uid, path: p }); }
+  catch (e) { say(`nasfile acl error: ${e.message}`); return json(res, 502, { error: 'acl-check-failed' }); }
+  const entry = Array.isArray(acl && acl.data) ? acl.data.find((x) => x.path === p) : null;
+  if (!entry || entry.readable !== true) return json(res, 403, { error: 'not-readable' });
+  fs.stat(p, (err, st) => {
+    if (err || !st.isFile()) return json(res, 404, { error: 'not-found' });
+    const name = p.slice(p.lastIndexOf('/') + 1);
+    res.writeHead(200, {
+      'Content-Type': 'application/octet-stream',
+      'Content-Length': st.size,
+      'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(name)}`,
+      'Cache-Control': 'no-store',
+    });
+    if (req.method === 'HEAD') { res.end(); return; }
+    const s = fs.createReadStream(p);
+    s.on('error', () => { try { res.destroy(); } catch {} });
+    s.pipe(res);
+    say(`nasfile serve [uid=${uid}] ${p} (${st.size}B)`);
+  });
+}
+
+// 列已授权目录里的 apk/xapk/apkm（目录+每个文件都过 ACL 校验），供「选择文件夹」批量入队
+async function handleNasList(req, res, url) {
+  const uid = Number(req.headers['x-trim-userid']);
+  if (!Number.isFinite(uid)) return json(res, 403, { error: 'no-user' });
+  let dir = url.searchParams.get('path') || '';
+  if (dir.includes('\0') || dir.includes('..') || !dir.startsWith('/vol')) return json(res, 400, { error: 'bad-path' });
+  dir = path.posix.normalize(dir);
+  if (!process.env.TRIM_API_TOKEN) return json(res, 503, { error: 'no-token' });
+  try {
+    // 1) 目录本身可读？
+    const dAcl = await trimCall('trim.file.checkUserACL', { uid, path: dir });
+    const dEntry = Array.isArray(dAcl && dAcl.data) ? dAcl.data.find((x) => x.path === dir) : null;
+    if (!dEntry || dEntry.readable !== true) return json(res, 403, { error: 'dir-not-readable' });
+    fs.readdir(dir, (err, names) => {
+      if (err) return json(res, 404, { error: 'readdir-failed' });
+      const cands = [];
+      for (const nm of names) {
+        if (nm.includes('/') || nm.includes('..')) continue;
+        const dot = nm.lastIndexOf('.');
+        if (dot < 0 || !NAS_EXT.has(nm.slice(dot + 1).toLowerCase())) continue;
+        cands.push(dir.replace(/\/+$/, '') + '/' + nm);
+        if (cands.length >= 300) break;
+      }
+      if (!cands.length) return json(res, 200, { files: [] });
+      // 2) 逐个文件再过一遍 ACL，只保留可读
+      trimCall('trim.file.checkUserACL', { uid, path: cands }).then((r) => {
+        const ok = new Set((Array.isArray(r && r.data) ? r.data : []).filter((x) => x.readable === true).map((x) => x.path));
+        const files = cands.filter((p) => ok.has(p)).map((p) => ({ path: p, name: p.slice(p.lastIndexOf('/') + 1) }));
+        json(res, 200, { files });
+        say(`naslist [uid=${uid}] ${dir} → ${files.length}/${cands.length}`);
+      }).catch((e) => { say(`naslist acl error: ${e.message}`); json(res, 502, { error: 'acl-check-failed' }); });
+    });
+  } catch (e) { say(`naslist error: ${e.message}`); json(res, 502, { error: 'acl-check-failed' }); }
+}
+
 // ── HTTP 服务 ──
 const app = http.createServer((req, res) => {
   let url;
@@ -276,6 +373,8 @@ const app = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' }).end('boxadb fnos ok\n');
     return;
   }
+  if (url.pathname === `${conf.prefix}/nasfile`) { handleNasFile(req, res, url); return; }
+  if (url.pathname === `${conf.prefix}/naslist`) { handleNasList(req, res, url); return; }
   // 飞牛入口 url=/app/boxadb 不带斜杠：302 到规范地址，
   // 否则页面里的相对资源（css/js）会解析到 /app/ 下而全部 404。
   if (url.pathname === conf.prefix) {
