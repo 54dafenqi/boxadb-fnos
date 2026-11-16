@@ -9,6 +9,29 @@
 appcenter-cli install-fpk boxadb.fpk   # 或应用中心 → 手动安装
 ```
 
+## 自动准备 5555（可选增强）
+
+Android 11+ 的「无线调试」使用**随机端口**，电视重启后 adbd 不再监听 5555；
+而浏览器端 ADB 引擎（ya-webadb 的 `AdbDaemonTransport`）没有 pairing 客户端，
+无法走无线调试的 TLS 配对，只能使用 5555 传统模式（电视上弹窗允许密钥）。
+
+**连接流程（对能正常连上的电视零影响）**：
+
+1. 先按原方式连接 `ip:5555`，成功即结束（**不发起任何额外请求**）；
+2. **只有连接失败时**，才调用 `GET /app/boxadb/discover?host=<盒子IP>`：
+   - `5555` 已在监听 → 直接返回；
+   - 否则用 mDNS（`_adb-tls-connect._tcp`）读出盒子**当前**的无线调试端口，
+     调用系统 `adb connect` + `adb tcpip 5555` 切回 5555；
+3. 修复成功后**自动重连一次**；失败则提示原因并保留原始错误。
+
+**可选依赖**（缺失时只有自动修复不可用，其余行为完全不变）：
+
+- `avahi-browse`（`apt install avahi-utils`）—— mDNS 查询
+- `adb`（Debian：`apt install -t bookworm-backports adb`）—— 切换端口
+
+**安全**：该接口要求管理员头 `x-trim-isadmin: true`，目标必须是**私网 IPv4**，
+只允许操作 `5555`（与桥接端口一致）；`execFile` 固定参数，不经过 shell。
+
 ## 相关项目
 
 本项目的界面，就是下面这个桌面 / 网页版「盒子助手」的同一套前端，为飞牛 fnOS 做的原生移植——功能一致，按场景二选一：

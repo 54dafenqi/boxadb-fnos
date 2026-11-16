@@ -27,6 +27,17 @@ function toast(msg, kind='info', ms=2800){ const el=document.createElement('div'
 let _t = null;
 async function tango() { if (!_t) _t = await import('./tango.js'); return _t; }
 
+// 连接失败后，请服务端自动发现并确保 5555 可用（最多等 15 秒；超时/出错返回 null）
+async function discoverPort(ip){
+  const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, 15000) : null;
+  try {
+    const r = await fetch(`discover?host=${encodeURIComponent(ip)}`, { cache: 'no-store', signal: ctrl ? ctrl.signal : undefined });
+    return await r.json().catch(() => null);
+  } catch { return null; }
+  finally { if (timer) clearTimeout(timer); }
+}
+
 // ── 假设备（仅 ?demo=1 预览用）─────────────────────────
 function demoDevice(ip='192.168.66.172'){ return { brand:'ONN', model:'ONN Google TV (Android 14)', android:'Android 14（SDK 34）', cpu:'Amlogic S905X4', gpu:'Mali-G31', arch:'64 位', mem:'可用 1.2 GB / 共 2.9 GB', resolution:'3840 × 2160', appCount:'18 个', uptime:'2 天 6 小时', storageText:'已用 4.1 GB / 共 11 GB（剩 6.9 GB）', storagePct:37, addr:`${ip}:5555` }; }
 const DEMO_APPS = [
@@ -72,14 +83,27 @@ async function doConnect() {
   const ip=$('#device-ip').value.trim();
   state.ip=ip; state.prefs.ip=ip; savePrefs();
   state.connecting=true; renderStatus();
+  let explained=false;   // 已经给过具体原因的提示，就不再叠加一条通用报错
   try {
     const T=await tango();
-    await T.connect({ ip });
+    try {
+      await T.connect({ ip });                     // 原有路径：能连上的电视完全不受影响
+    } catch (firstErr) {
+      // 连不上才尝试「自动准备 5555」（Android 11+ 电视重启后 adbd 会改用随机端口）
+      const info=await discoverPort(ip);
+      if(info&&info.ok&&info.repaired){
+        toast('已自动切换端口，重连中...');
+        await T.connect({ ip, port: info.port });
+      }else{
+        if(info&&info.error){ toast(info.error,'warn',5000); explained=true; }
+        throw firstErr;
+      }
+    }
     state.device=await T.fetchDevice(ip);
     state.connected=true;
     toast(`已连接：${state.device.brand} ${state.device.model}`);
   } catch (err) {
-    toast('连接失败：'+err.message,'err',4200);
+    if(!explained) toast(err.message,'err',4200);
   } finally { state.connecting=false; renderStatus(); if (state.connected) refreshApps(); }
 }
 function bindHeader(){
