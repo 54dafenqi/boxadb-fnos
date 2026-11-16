@@ -27,7 +27,24 @@ Android 11+ 的「无线调试」使用**随机端口**，电视重启后 adbd �
 **可选依赖**（缺失时只有自动修复不可用，其余行为完全不变）：
 
 - `avahi-browse`（`apt install avahi-utils`）—— mDNS 查询
-- `adb`（Debian：`apt install -t bookworm-backports adb`）—— 切换端口
+- `adb` —— 切换端口。本功能只用到 `adb connect` / `adb devices` / `adb tcpip`，
+  **任意版本均可**；但下面「首次准备」的方式 B 需要 `adb pair`，该命令要求 **30.0.0+**
+  （Debian main 自带 29.0.6 不含 `pair`，因此推荐 `apt install -t bookworm-backports adb`）
+
+**首次准备（每台电视只需一次，二选一）**：
+
+- **方式 A（最省事，不需要配对，也不需要高版本 adb）**：
+  在任意一台电脑上 USB 连接电视，执行一次
+  ```bash
+  adb tcpip 5555
+  ```
+  之后首次连接时在电视上点「允许」即可；
+- **方式 B（无需 USB，但需要 adb ≥ 30）**：电视打开「无线调试 → 使用配对码配对设备」并**保持弹窗不要关闭**，
+  在 NAS 上执行：
+  ```bash
+  adb pair <电视IP>:<配对端口> <6位配对码>
+  ```
+  配对一次后，后续由本功能的 `/discover` 自动维持 5555，不再需要手动操作。
 
 **安全**：该接口要求管理员头 `x-trim-isadmin: true`，目标必须是**私网 IPv4**，
 只允许操作 `5555`（与桥接端口一致）；`execFile` 固定参数，不经过 shell。
