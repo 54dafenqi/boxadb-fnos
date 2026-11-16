@@ -9,6 +9,12 @@
 appcenter-cli install-fpk boxadb.fpk   # 或应用中心 → 手动安装
 ```
 
+## 相关项目
+
+本项目的界面，就是下面这个桌面 / 网页版「盒子助手」的同一套前端，为飞牛 fnOS 做的原生移植——功能一致，按场景二选一：
+
+- **[boxadb（桌面 / 网页版）](https://github.com/wukongdaily/boxadb)** —— 电脑开本地桥，浏览器直接访问 <https://wukongdaily.github.io/boxadb/>，支持 WebUSB 数据线直连。
+- **boxadb-fnos（本项目 · 飞牛版）** —— 盒子助手常驻 NAS、经统一网关同源，手机在客厅也能开网页连盒子，不必在每台电脑另开桥。
 
 ## 第三方组件致谢（均为 MIT）
 
