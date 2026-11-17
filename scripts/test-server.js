@@ -155,6 +155,44 @@ function wsEcho(host, targetPort) {
   ok(!/if \(!navigator\.usb\)/.test(fApp), '旧的「只判 navigator.usb」写法已消失');
   ok(fApp.includes('fnos/nas-pick.js'), '飞牛钩子仍在（补丁两步共存）');
 
+  // 弹窗引导必须按「服务是否自带 https 端口」分流：飞牛 server.js 不注入 boxadb-tls-port，
+  // 而包内 app.js 的 SELF_HOSTED 已被补丁钉成 true —— 两者混用过会教飞牛用户去 ssh -L 8765。
+  const appSrc2 = fApp;
+  const extractFn = (src, name) => {
+    const i = src.indexOf('function ' + name + '(');
+    if (i < 0) return '';
+    let d = 0;
+    for (let k = src.indexOf('{', i); k < src.length; k++) {
+      if (src[k] === '{') d++;
+      else if (src[k] === '}' && --d === 0) return src.slice(i, k + 1);
+    }
+    return '';
+  };
+  const runDialog = (metas) => {
+    const els = {};
+    const $ = (sel) => (els[sel] = els[sel] || { hidden: true, textContent: '', onclick: null });
+    const doc = { querySelector: (sel) => {
+      const m = /meta\[name="([^"]+)"\]/.exec(sel);
+      return m && m[1] in metas ? { content: metas[m[1]] } : null;
+    } };
+    // 与包内一致：SELF_HOSTED 在飞牛包里恒为 true
+    const fn = new Function('SELF_HOSTED', 'document', 'location', 'window', '$', 'toast', 'insecureFixUrl',
+      extractFn(appSrc2, 'showInsecureDialog') + ';return showInsecureDialog;')(
+        true, doc, { hostname: '192.168.66.218', pathname: '/app/boxadb/', search: '', replace() {} },
+        { self: {}, top: {}, open() { return {}; } }, $, () => {}, () => 'https://192.168.66.218:5667/');
+    fn();
+    return els;
+  };
+  ok(!/const selfHost = SELF_HOSTED/.test(appSrc2), '弹窗判定未复用 SELF_HOSTED');
+  const fnosDlg = runDialog({ 'boxadb-mode': 'selfhosted', 'boxadb-prefix': '/app/boxadb' });
+  ok(fnosDlg['#insecure-fnos'].hidden === false && fnosDlg['#insecure-selfhost'].hidden === true,
+    '飞牛页面（无 tls-port）显示「打开飞牛加密主页」引导、不出容器版引导');
+  ok(fnosDlg['#insecure-tls'].hidden === true && /5667/.test(fnosDlg['#insecure-url'].textContent),
+    '飞牛版不出 https 一键按钮，5667 地址正确给出');
+  const dockDlg = runDialog({ 'boxadb-mode': 'selfhosted', 'boxadb-prefix': '', 'boxadb-tls-port': '8766' });
+  ok(dockDlg['#insecure-selfhost'].hidden === false && dockDlg['#insecure-fnos'].hidden === true,
+    '若服务自带 tls-port 则切到容器版引导（分流条件确实只看 tls-port）');
+
   echo.close();
   console.log(`\n结果: ${pass} 通过 / ${fail} 失败`);
   process.exit(fail ? 1 : 0);

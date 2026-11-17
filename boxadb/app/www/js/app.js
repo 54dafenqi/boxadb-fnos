@@ -308,15 +308,18 @@ function insecureFixUrl(){
 }
 function showInsecureDialog(){
   const m=$('#insecure-modal'); if(!m) return;
-  // 自托管（NAS/Docker 桥自己发页）时，跳飞牛 5667 是死路，改给对应的正确做法
-  const selfHost = SELF_HOSTED;
-  const fnosBox=$('#insecure-fnos'), selfBox=$('#insecure-selfhost');
-  if(fnosBox) fnosBox.hidden=selfHost;
-  if(selfBox) selfBox.hidden=!selfHost;
-
-  // 自托管形态：服务自带 https 端口，一键切过去（桌面 Pages 没有这个 meta，按钮自然隐藏）
+  // 两套引导按「服务是否自带 https 端口」分流，不能复用 SELF_HOSTED：
+  //   · 自托管 Go 桥（Docker / NAS 容器）会注入 boxadb-tls-port → 一键切到自己的 https
+  //   · 飞牛走统一网关、没有自带端口（加密入口是 5667）→ 显示「打开飞牛加密主页」
+  // SELF_HOSTED 只管 WebUSB 入口门控：飞牛同样是自托管形态，但两套引导文案完全不同。
   const tlsPort=(document.querySelector('meta[name="boxadb-tls-port"]')?.content||'').trim();
-  const httpsUrl=(selfHost && /^\d{2,5}$/.test(tlsPort))
+  const ownTls=/^\d{2,5}$/.test(tlsPort);
+  const fnosBox=$('#insecure-fnos'), selfBox=$('#insecure-selfhost');
+  if(fnosBox) fnosBox.hidden = ownTls || !SELF_HOSTED;
+  if(selfBox) selfBox.hidden = !ownTls;
+
+  // 自带 https 端口时才给一键跳转（桌面 Pages 两个 meta 都没有，按钮自然隐藏）
+  const httpsUrl=ownTls
     ? `https://${location.hostname}:${tlsPort}${location.pathname}${location.search}` : '';
   const tbtn=$('#insecure-tls'), turl=$('#insecure-tls-url');
   if(tbtn) tbtn.hidden=!httpsUrl;
@@ -327,7 +330,7 @@ function showInsecureDialog(){
     if(!w){ toast('浏览器拦住了新标签，请手动把地址里的 http:// 改成 https://','err',8000); return; }
     toast('证书提示页点「高级 → 继续访问」，只需一次即可长期使用','info',7000);
   };
-  const url=selfHost?'':insecureFixUrl();
+  const url=ownTls?'':insecureFixUrl();
   const s=$('#insecure-url'); if(s) s.textContent=url?`将打开：${url}`:'';
   const b=$('#insecure-fix');
   if(b) b.onclick=()=>{
