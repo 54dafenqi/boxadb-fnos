@@ -3,9 +3,18 @@ import * as stream from './vendor/stream-extra.js';
 import CredentialStore from './vendor/adb-credential-web.js';
 import { unzipSync } from './vendor/fflate.js';
 
-// 飞牛版：页面与桥同源（统一网关 /app/boxadb），WS 直接用当前域名，无固定地址
-const GATEWAY_PREFIX = '/app/boxadb';
-const BRIDGE_WS_BASE = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}${GATEWAY_PREFIX}`;
+// 桥地址：GitHub Pages 场景固定连本机 127.0.0.1:8765（不给用户填）。
+// 自托管形态（NAS/Docker，网页由桥自己发出）改为同源 + 前缀，前缀由服务端在
+// index.html 运行时注入，前端不做任何构建期改写：
+//   <meta name="boxadb-mode" content="selfhosted">
+//   <meta name="boxadb-prefix" content="/app/boxadb">   容器形态为空
+export const selfHosted = typeof document !== 'undefined'
+  && document.querySelector('meta[name="boxadb-mode"]')?.content === 'selfhosted';
+const bridgePrefix = typeof document !== 'undefined'
+  ? (document.querySelector('meta[name="boxadb-prefix"]')?.content || '') : '';
+export const BRIDGE_BASE = selfHosted
+  ? `${location.protocol}//${location.host}${bridgePrefix}`
+  : 'http://127.0.0.1:8765';
 const DEFAULT_PORT = 5555;                            // 固定端口，不进输入框
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -13,7 +22,8 @@ let handle = null; // { adb, closeSocket }
 
 // ── 把 WebSocket 字节流包成 ADB 的包流 ───────────────
 async function bridgeStream(host, port) {
-  const wsUrl = `${BRIDGE_WS_BASE}/adb?host=${encodeURIComponent(host)}&port=${port}`;
+  const wsUrl = BRIDGE_BASE.replace(/^http/, 'ws') +
+    `/adb?host=${encodeURIComponent(host)}&port=${port}`;
   const socket = new WebSocket(wsUrl);
   socket.binaryType = 'arraybuffer';
 

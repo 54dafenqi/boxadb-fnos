@@ -5,6 +5,7 @@ const http = require('node:http');
 const net = require('node:net');
 const crypto = require('node:crypto');
 const path = require('path');
+const fs = require('node:fs');
 
 const SERVER = path.join(__dirname, '..', 'boxadb', 'app', 'server', 'server.js');
 const PORT = 8899;
@@ -82,6 +83,13 @@ function wsEcho(host, targetPort) {
   console.log('--- HTTP ---');
   const idx = await req(PREFIX + '/');
   ok(idx.code === 200 && idx.body.includes('盒子助手'), `index 200 + 标题 (got ${idx.code})`);
+  // 运行时注入自托管标记（与 Docker 版同一机制，取代旧的构建期地址改写）
+  ok(idx.body.includes('name="boxadb-mode" content="selfhosted"'), 'index 注入 boxadb-mode=selfhosted');
+  ok(idx.body.includes(`name="boxadb-prefix" content="${PREFIX}"`), `index 注入前缀 ${PREFIX}`);
+  ok((idx.body.match(/boxadb-mode/g) || []).length === 1, '标记只注入一次');
+  const tj = await req(PREFIX + '/js/tango.js');
+  ok(tj.code === 200 && tj.body.includes('meta[name="boxadb-prefix"]') && !tj.body.includes('GATEWAY_PREFIX'),
+    'tango.js 未被改写（旧补丁机制已废弃）');
   const js = await req(PREFIX + '/js/app.js');
   ok(js.code === 200 && js.body.includes('import'), 'app.js 200');
   const css = await req(PREFIX + '/css/style.css');
@@ -133,6 +141,19 @@ function wsEcho(host, targetPort) {
   });
   ok(!String(deny).startsWith('HTTP/1.1 101'), `非管理员拒绝 (${deny})`);
   guarded.kill('SIGTERM');
+
+  console.log('--- 飞牛专属不变量：USB 直连必须彻底消失 ---');
+  // 飞牛是 NAS 应用，桥在 NAS 上；USB 直连连的是打开网页那台电脑的 USB，无意义。
+  // v0.1.23 曾因「只判 navigator.usb」被 Chrome 打开时暴露该按钮，此处锁死防回归。
+  const WWW = path.join(__dirname, '..', 'boxadb', 'app', 'www');
+  const fHtml = fs.readFileSync(path.join(WWW, 'index.html'), 'utf8');
+  const fApp = fs.readFileSync(path.join(WWW, 'js', 'app.js'), 'utf8');
+  const btn = (fHtml.match(/<button id="usb-toggle"[^>]*>/) || [''])[0];
+  ok(/\shidden\b/.test(btn), 'index.html 里 #usb-toggle 默认 hidden');
+  ok(fApp.includes('const SELF_HOSTED = true;'), 'app.js 形态常量被钉死为自托管（不依赖 meta）');
+  ok(fApp.includes('if (!SELF_HOSTED && navigator.usb)'), '显示入口仍受 !SELF_HOSTED 门控（钉死后恒假）');
+  ok(!/if \(!navigator\.usb\)/.test(fApp), '旧的「只判 navigator.usb」写法已消失');
+  ok(fApp.includes('fnos/nas-pick.js'), '飞牛钩子仍在（补丁两步共存）');
 
   echo.close();
   console.log(`\n结果: ${pass} 通过 / ${fail} 失败`);

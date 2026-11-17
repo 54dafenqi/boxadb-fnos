@@ -237,6 +237,20 @@ const MIME = {
   webp: 'image/webp', woff: 'font/woff', woff2: 'font/woff2', txt: 'text/plain; charset=utf-8',
 };
 
+// 自托管标记：与 Docker 版同一套机制 —— 前端据此把桥地址切成「同源 + 网关前缀」，
+// 因此 www 里的 JS 与桌面源码逐字节一致，不需要任何构建期地址改写。
+function markSelfHosted(buf) {
+  const s = buf.toString('utf8');
+  if (s.includes('boxadb-mode')) return buf;
+  const i = s.indexOf('<head');
+  if (i < 0) return buf;
+  const j = s.indexOf('>', i);
+  if (j < 0) return buf;
+  const at = j + 1;
+  const meta = `\n<meta name="boxadb-mode" content="selfhosted"><meta name="boxadb-prefix" content="${conf.prefix}">`;
+  return Buffer.from(s.slice(0, at) + meta + s.slice(at), 'utf8');
+}
+
 function servePage(req, res, url) {
   let rel = '/';
   try { rel = decodeURIComponent(url.pathname.slice(conf.prefix.length)) || '/'; }
@@ -252,12 +266,19 @@ function servePage(req, res, url) {
   fs.stat(file, (err, st) => {
     if (err || !st.isFile()) { res.writeHead(404).end('not found'); return; }
     const ext = file.slice(file.lastIndexOf('.') + 1).toLowerCase();
-    res.writeHead(200, {
+    const headers = {
       'Content-Type': MIME[ext] || 'application/octet-stream',
-      'Content-Length': st.size,
       'Cache-Control': 'no-store',
-    });
+    };
+    let body = null;
+    if (/^index\.html$/i.test(path.basename(file))) {
+      try { body = markSelfHosted(fs.readFileSync(file)); headers['Content-Length'] = body.length; }
+      catch { body = null; }
+    }
+    headers['Content-Length'] = body ? body.length : st.size;
+    res.writeHead(200, headers);
     if (req.method === 'HEAD') { res.end(); return; }
+    if (body) { res.end(body); return; }
     fs.createReadStream(file).pipe(res);
   });
 }

@@ -2,6 +2,11 @@
 import * as BoxTerm from './terminal.js';
 import * as Icons from './icons.js';
 
+// 自托管形态（Docker / 飞牛应用）由服务端在 index.html 注入这个 meta。
+// 该形态下桥跑在 NAS 上，「USB 直连」连的是打开网页那台电脑的 USB，
+// 与「远端桥走网络」的定位冲突，所以整个入口不渲染；Pages / 桌面版才显示。
+const SELF_HOSTED = true;  // 飞牛=NAS 应用，永不自助 USB；此常量由 patch-app-fnos.py 钉死
+
 const state = {
   connected: false,
   connecting: false,
@@ -104,7 +109,9 @@ function bindHeader(){
   const ut=$('#usb-toggle'); if (ut) ut.addEventListener('click', ()=>{ const p=$('#usb-panel'); if (p) p.hidden=!p.hidden; });
   const ub=$('#connect-usb-btn'); if (ub) ub.addEventListener('click', doConnectUsb);
   const uc=$('#usb-close'); if (uc) uc.addEventListener('click', ()=>{ const p=$('#usb-panel'); if (p) p.hidden=true; });
-  if (!navigator.usb) { const t=$('#usb-toggle'); if (t) t.hidden=true; const p=$('#usb-panel'); if (p) p.hidden=true; }
+  // HTML 里默认 hidden：仅 Pages / 桌面版 + 浏览器支持 WebUSB 才显示；自托管永不显示
+  if (!SELF_HOSTED && navigator.usb) { const t=$('#usb-toggle'); if (t) t.hidden=false; }
+  else { const p=$('#usb-panel'); if (p) p.hidden=true; }
   state.prefs=loadPrefs();
   if (state.prefs.ip) $('#device-ip').value=state.prefs.ip;
 }
@@ -301,7 +308,26 @@ function insecureFixUrl(){
 }
 function showInsecureDialog(){
   const m=$('#insecure-modal'); if(!m) return;
-  const url=insecureFixUrl();
+  // 自托管（NAS/Docker 桥自己发页）时，跳飞牛 5667 是死路，改给对应的正确做法
+  const selfHost = SELF_HOSTED;
+  const fnosBox=$('#insecure-fnos'), selfBox=$('#insecure-selfhost');
+  if(fnosBox) fnosBox.hidden=selfHost;
+  if(selfBox) selfBox.hidden=!selfHost;
+
+  // 自托管形态：服务自带 https 端口，一键切过去（桌面 Pages 没有这个 meta，按钮自然隐藏）
+  const tlsPort=(document.querySelector('meta[name="boxadb-tls-port"]')?.content||'').trim();
+  const httpsUrl=(selfHost && /^\d{2,5}$/.test(tlsPort))
+    ? `https://${location.hostname}:${tlsPort}${location.pathname}${location.search}` : '';
+  const tbtn=$('#insecure-tls'), turl=$('#insecure-tls-url');
+  if(tbtn) tbtn.hidden=!httpsUrl;
+  if(turl) turl.textContent=httpsUrl?`将打开：${httpsUrl}`:'';
+  if(tbtn) tbtn.onclick=()=>{
+    if(window.self===window.top){ location.replace(httpsUrl); return; }
+    const w=window.open(httpsUrl,'_blank','noopener');
+    if(!w){ toast('浏览器拦住了新标签，请手动把地址里的 http:// 改成 https://','err',8000); return; }
+    toast('证书提示页点「高级 → 继续访问」，只需一次即可长期使用','info',7000);
+  };
+  const url=selfHost?'':insecureFixUrl();
   const s=$('#insecure-url'); if(s) s.textContent=url?`将打开：${url}`:'';
   const b=$('#insecure-fix');
   if(b) b.onclick=()=>{
