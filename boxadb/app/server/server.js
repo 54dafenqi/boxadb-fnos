@@ -405,6 +405,67 @@ async function findPortByMdns(host) {
 
 let repairing = false;
 
+// ── 「配对」：把 NAS 的 adb 密钥与电视的无线调试配对（一次性）──────────────
+// 电视：开发者选项 → 无线调试 → 使用配对码配对设备（弹窗保持打开），
+// 把弹窗里的「配对端口」和 6 位配对码填进网页即可。配对一次后由 /discover 自动维持 5555。
+
+const MAX_BODY = 4 * 1024;
+
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > MAX_BODY) { reject(new Error('body too large')); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')); }
+      catch (e) { reject(e); }
+    });
+    req.on('error', reject);
+  });
+}
+
+let pairing = false;
+
+async function handlePair(req, res) {
+  if (conf.adminRequired && String(req.headers['x-trim-isadmin'] || '').toLowerCase() !== 'true') {
+    return json(res, 403, { ok: false, error: '仅管理员可使用配对' });
+  }
+  let body;
+  try { body = await readJsonBody(req); }
+  catch { return json(res, 400, { ok: false, error: '请求格式错误' }); }
+
+  const host = String(body.host || '').trim();
+  const port = Number(body.port);
+  const code = String(body.code || '').trim();
+  if (!isPrivateIPv4(host)) return json(res, 400, { ok: false, error: '目标必须是私网 IPv4 地址' });
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return json(res, 400, { ok: false, error: '配对端口不合法' });
+  if (!/^\d{6}$/.test(code)) return json(res, 400, { ok: false, error: '配对码应为 6 位数字' });
+  if (pairing) return json(res, 503, { ok: false, error: '另一个配对正在进行，请稍等' });
+
+  pairing = true;
+  try {
+    say(`pair: ${host}:${port} 开始配对`);
+    const r = await run('adb', ['pair', `${host}:${port}`, code], 20000);
+    if (r.code === 'ENOENT') return json(res, 502, { ok: false, error: 'NAS 上未安装 adb' });
+    const out = (r.stdout + ' ' + r.stderr).replace(/\s+/g, ' ').trim().slice(0, 300);
+    if (!r.ok || !/Successfully paired/i.test(out)) {
+      say(`pair: 失败 ${out}`);
+      return json(res, 502, { ok: false, error: out || '配对失败' });
+    }
+    say(`pair: ${host}:${port} 配对成功`);
+    return json(res, 200, { ok: true, message: '配对成功' });
+  } catch (e) {
+    say(`pair error: ${e.message}`);
+    return json(res, 502, { ok: false, error: e.message });
+  } finally {
+    pairing = false;
+  }
+}
+
 async function handleDiscover(req, res, url) {
   const host = url.searchParams.get('host') || '';
   if (conf.adminRequired && String(req.headers['x-trim-isadmin'] || '').toLowerCase() !== 'true') {
@@ -429,7 +490,7 @@ async function handleDiscover(req, res, url) {
     if (!found) {
       return json(res, 502, {
         ...base, ok: false,
-        error: '仅 Chromecast with Google TV 4K 需在开发者选项中同时开启 USB 调试和无线调试',
+        error: '仅 Chromecast with Google TV 需在开发者选项中同时开启 USB 调试和无线调试',
       });
     }
     say(`discover: ${host} 无线调试端口=${found}，尝试切回 ${conf.tunnelPort}`);
@@ -447,8 +508,9 @@ async function handleDiscover(req, res, url) {
     }
     if (state !== 'device') {
       return json(res, 502, {
-        ...base, ok: false, discoveredPort: found,
-        error: `已发现端口 ${found}，但连接状态是「${state || '未连接'}」（请在电视上允许调试 / 确认已配对）`,
+        ...base, ok: false, discoveredPort: found, needPair: true,
+        error: `已发现无线调试端口 ${found}，但电视还没有授权本机（这是首次使用或授权被撤销的情况）。
+请点右上角「配对」完成一次配对：电视上打开 开发者选项 → 无线调试 → 使用配对码配对设备，把端口和 6 位码填进来。`,
       });
     }
     await run('adb', ['-s', `${host}:${found}`, 'tcpip', String(conf.tunnelPort)], 8000);
@@ -475,6 +537,8 @@ const app = http.createServer((req, res) => {
   catch { res.writeHead(400).end('bad request'); return; }
 
   if (req.method !== 'GET' && req.method !== 'HEAD') {
+    // 唯一的 POST 接口：配对（无线调试）
+    if (req.method === 'POST' && url.pathname === `${conf.prefix}/pair`) { handlePair(req, res); return; }
     res.writeHead(405).end('method not allowed');
     return;
   }
