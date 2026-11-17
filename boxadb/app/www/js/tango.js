@@ -70,6 +70,40 @@ export async function connect({ ip, port = DEFAULT_PORT } = {}) {
   return { adb: a, closeSocket };
 }
 
+// ── USB 直连（WebUSB，仅 Chromium）─────────────────────
+// 少数机型不便走 WiFi 桥时的兜底。关键前提：本机 adb server 会占着 USB 句柄，
+// 浏览器要连之前必须先 `adb kill-server` 释放，否则 requestDevice 拿到也连不上。
+export async function connectUsb() {
+  if (!navigator.usb) throw new Error('当前浏览器不支持 USB 直连，请改用 Chrome / Edge');
+  const { AdbDaemonWebUsbDeviceManager } = await import('./vendor/adb-daemon-webusb.js');
+  const manager = AdbDaemonWebUsbDeviceManager.BROWSER;
+  let device;
+  try {
+    device = await manager.requestDevice();
+  } catch (e) {
+    if (/busy|claim|open/i.test(String(e && e.message || e)))
+      throw new Error('设备被占用：请先在终端运行 adb kill-server 释放后重试');
+    throw new Error('未选择设备（已取消）');
+  }
+  if (!device) throw new Error('未选择设备（已取消）');
+  const connection = await device.connect();   // WebUSB 的 connection 已是 ADB 包流，直接喂 authenticate
+  let transport;
+  try {
+    transport = await withTimeout(
+      adb.AdbDaemonTransport.authenticate({ serial: device.serial || 'usb', connection, credentialStore: new CredentialStore('boxadb') }),
+      30000, '连接超时：请在盒子上允许 USB 调试'
+    );
+  } catch (e) {
+    try { device.close(); } catch {}
+    throw /auth/i.test(String(e?.message || e)) ? new Error('设备未授权：请在盒子弹窗点「允许 USB 调试」') : e;
+  }
+  const a = new adb.Adb(transport);
+  handle = { adb: a, closeSocket: () => { try { device.close(); } catch {} } };
+  _sdk = null;
+  a.disconnected.then(() => { if (handle && handle.adb === a) handle = null; }, () => {});
+  return { adb: a };
+}
+
 export function connected() { return !!handle; }
 
 export async function disconnect() {
@@ -289,6 +323,24 @@ async function parsePackage(file) {
   throw new Error('不支持的文件类型（仅支持 .apk / .xapk / .apkm）');
 }
 
+// ── 安装错误人话化：把厂商限制 / 常见 INSTALL_FAILED_* 翻成中文指引 ──
+export function friendlyInstallError(raw) {
+  const s = String(raw || '');
+  if (/install_switch_flag|disabled .*from pm|by system default|not allowed to install|install .*disabled/i.test(s))
+    return '这台电视（TCL / 雷鸟 / 海信等厂商机型）默认禁止安装第三方应用。请先到电视「设置 → 安全 / 未知来源 / 允许安装第三方应用」里打开再装；也可在下方「ADB 终端」执行 settings put global install_switch_flag 1 试试。';
+  if (/INSTALL_FAILED_NO_MATCHING_ABIS|res=-113/i.test(s))
+    return '这个应用的 CPU 架构和盒子不匹配（例如给 32 位盒子装了 64 位包），换对应版本再装。';
+  if (/INSTALL_FAILED_INSUFFICIENT_STORAGE/i.test(s))
+    return '盒子存储空间不足，先清理一些应用或文件再装。';
+  if (/INSTALL_FAILED_UPDATE_INCOMPATIBLE|signatures do not match/i.test(s))
+    return '已装过同名应用但签名不一致，需要先在盒子上卸载旧版本再装。';
+  if (/INSTALL_FAILED_OLDER_SDK|minSdkVersion/i.test(s))
+    return '这个应用要求的安卓版本比盒子当前系统更高，装不了。';
+  if (/INSTALL_FAILED_ABORTED|user rejected|aborted/i.test(s))
+    return '安装被取消了（盒子上的确认弹窗被拒绝或超时）。';
+  return s;
+}
+
 // ── 安装：APK/XAPK/APKM/APKS，split + obb，流式（APK 不落地，pm install-create/write/commit）──
 export async function installFile(file, onProgress) {
   const { apks, obbs } = await parsePackage(file);
@@ -314,14 +366,14 @@ export async function installFile(file, onProgress) {
 
   const create = await shell('pm install-create -r');
   const m = create.match(/\[(\d+)\]/);
-  if (!m) throw new Error('创建安装会话失败：' + create.trim());
+  if (!m) throw new Error(friendlyInstallError('创建安装会话失败：' + create.trim()));
   const sid = m[1];
 
   try {
     for (const p of apks) {
       const res = await shellWriteBytes(`pm install-write -S ${p.bytes.length} ${sid} ${p.name}`, p.bytes);
       tick(p.bytes.length);
-      if (fail(res)) throw new Error('写入 ' + p.name + ' 失败：' + res.trim());
+      if (fail(res)) throw new Error(friendlyInstallError('写入 ' + p.name + ' 失败：' + res.trim()));
     }
     for (const o of obbs) {
       if (!o.pkg) continue;
@@ -331,7 +383,7 @@ export async function installFile(file, onProgress) {
       tick(o.bytes.length);
     }
     const commit = await shell(`pm install-commit ${sid}`);
-    if (fail(commit)) throw new Error('提交安装失败：' + commit.trim());
+    if (fail(commit)) throw new Error(friendlyInstallError('提交安装失败：' + commit.trim()));
     onProgress && onProgress(total, total);
     return (file.name || '包') + ' 安装完成';
   } catch (e) {
@@ -347,7 +399,7 @@ async function legacyInstall(apk, tick) {
     await pushBytes(tmp, apk.bytes);
     tick && tick(apk.bytes.length);
     const r = await shell(`pm install -r '${tmp}'`);
-    if (!/Success/i.test(r)) throw new Error('安装失败：' + (r || '').trim());
+    if (!/Success/i.test(r)) throw new Error(friendlyInstallError('安装失败：' + (r || '').trim()));
     return (apk.name || '包') + ' 安装完成';
   } finally {
     try { await shell(`rm -f '${tmp}'`); } catch {}
